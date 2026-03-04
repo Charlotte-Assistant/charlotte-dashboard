@@ -9,6 +9,7 @@ interface Task {
   status: 'backlog' | 'todo' | 'in_progress' | 'completed'
   priority: 'critical' | 'high' | 'medium' | 'low'
   category: string
+  projectId?: string
   assigned_to: string
   created_date: string
   updated_date: string
@@ -16,6 +17,12 @@ interface Task {
   estimated_hours: number
   actual_hours: number
   tags: string[]
+}
+
+interface Project {
+  id: string
+  name: string
+  color: string
 }
 
 interface TasksData {
@@ -52,9 +59,11 @@ const categoryColors: Record<string, string> = {
 
 export default function TasksPage() {
   const [tasksData, setTasksData] = useState<TasksData | null>(null)
+  const [projects, setProjects] = useState<Project[]>([])
   const [loading, setLoading] = useState(true)
   const [filterCategory, setFilterCategory] = useState<string>('all')
   const [filterPriority, setFilterPriority] = useState<string>('all')
+  const [filterProject, setFilterProject] = useState<string>('all')
   const [updating, setUpdating] = useState<string | null>(null)
 
   const fetchTasks = async () => {
@@ -71,8 +80,19 @@ export default function TasksPage() {
     }
   }
 
+  const fetchProjects = async () => {
+    try {
+      const response = await fetch('/api/charlotte/projects')
+      const data = await response.json()
+      setProjects(data.projects || [])
+    } catch (error) {
+      console.error('Failed to fetch projects:', error)
+    }
+  }
+
   useEffect(() => {
     fetchTasks()
+    fetchProjects()
     // Refresh every 30 seconds
     const interval = setInterval(fetchTasks, 30000)
     return () => clearInterval(interval)
@@ -104,8 +124,14 @@ export default function TasksPage() {
     return tasks.filter(task => {
       const categoryMatch = filterCategory === 'all' || task.category.toLowerCase() === filterCategory.toLowerCase()
       const priorityMatch = filterPriority === 'all' || task.priority === filterPriority
-      return categoryMatch && priorityMatch
+      const projectMatch = filterProject === 'all' || task.projectId === filterProject
+      return categoryMatch && priorityMatch && projectMatch
     })
+  }
+
+  const getProjectForTask = (projectId?: string) => {
+    if (!projectId) return null
+    return projects.find(p => p.id === projectId)
   }
 
   const renderColumn = (status: 'backlog' | 'todo' | 'in_progress' | 'completed', title: string) => {
@@ -178,11 +204,26 @@ export default function TasksPage() {
                   {task.description}
                 </p>
 
-                {/* Category Badge */}
-                <div className="flex items-center gap-2 mb-2">
+                {/* Category & Project Badges */}
+                <div className="flex items-center gap-2 mb-2 flex-wrap">
                   <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${categoryColors[task.category] || categoryColors['Etc.']}`}>
                     {task.category}
                   </span>
+                  {task.projectId && (() => {
+                    const project = getProjectForTask(task.projectId)
+                    return project ? (
+                      <span 
+                        className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border"
+                        style={{ 
+                          backgroundColor: `${project.color}20`,
+                          color: project.color,
+                          borderColor: `${project.color}40`
+                        }}
+                      >
+                        🗂️ {project.name}
+                      </span>
+                    ) : null
+                  })()}
                 </div>
 
                 {/* Time Info */}
@@ -244,7 +285,18 @@ export default function TasksPage() {
         </div>
 
         {/* Right: Filters */}
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
+          <select
+            value={filterProject}
+            onChange={(e) => setFilterProject(e.target.value)}
+            className="text-sm px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300"
+          >
+            <option value="all">All Projects</option>
+            {projects.map(proj => (
+              <option key={proj.id} value={proj.id}>🗂️ {proj.name}</option>
+            ))}
+          </select>
+
           <select
             value={filterCategory}
             onChange={(e) => setFilterCategory(e.target.value)}

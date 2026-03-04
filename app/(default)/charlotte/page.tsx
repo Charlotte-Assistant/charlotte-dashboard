@@ -11,6 +11,7 @@ import MemorySearchCard from './memory-search-card'
 import ClusterNavigationCard from './cluster-navigation-card'
 import SystemMetricsCard from './system-metrics-card'
 import TasksSummaryCard from './tasks-summary-card'
+import ProjectsCard from './projects-card'
 
 export default function CharlotteHealth() {
   return (
@@ -58,6 +59,9 @@ export default function CharlotteHealth() {
 
         {/* Task Management - Summary Card */}
         <TasksSummaryCard />
+
+        {/* Projects Management Card */}
+        <ProjectsCard />
 
         {/* Memory Stats */}
         <MemoryStatsCard />
