@@ -13,6 +13,7 @@ import ClusterNavigationCard from './cluster-navigation-card'
 import SystemMetricsCard from './system-metrics-card'
 import TasksSummaryCard from './tasks-summary-card'
 import ProjectsCard from './projects-card'
+import ScheduledJobsSummaryCard from './scheduled-jobs-summary-card'
 
 export default function CharlotteHealth() {
   return (
@@ -63,6 +64,9 @@ export default function CharlotteHealth() {
 
         {/* Projects Management Card */}
         <ProjectsCard />
+
+        {/* Scheduled Jobs Summary Card */}
+        <ScheduledJobsSummaryCard />
 
         {/* Memory Summary Card */}
         <MemorySummaryCard />

@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "lastUpdated": "2026-03-04T04:52:15.676Z",
+  "jobs": [
+    {
+      "id": "job-news-briefing",
+      "name": "Morning News Briefing",
+      "description": "Compiles top headlines and sends a concise daily update.",
+      "cron": "0 8 * * 1-5",
+      "timezone": "America/Guayaquil",
+      "command": "python morning-news-briefing.py",
+      "active": true,
+      "health": "healthy",
+      "tags": [
+        "briefing",
+        "daily"
+      ],
+      "createdAt": "2026-02-20T08:00:00.000Z",
+      "updatedAt": "2026-03-03T22:40:00.000Z",
+      "lastRunAt": "2026-03-03T13:00:00.000Z",
+      "nextRunAt": "2026-03-04T13:00:00.000Z",
+      "lastRunStatus": "success",
+      "lastDurationMs": 18200,
+      "runCount": 24,
+      "successCount": 23,
+      "failureCount": 1
+    },
+    {
+      "id": "job-project-sync",
+      "name": "Project State Sync",
+      "description": "Refreshes dashboard project/task rollups and cache.",
+      "cron": "*/30 * * * *",
+      "timezone": "America/Guayaquil",
+      "command": "node scripts/project-sync.js",
+      "active": false,
+      "health": "healthy",
+      "tags": [
+        "projects",
+        "cache"
+      ],
+      "createdAt": "2026-02-28T10:00:00.000Z",
+      "updatedAt": "2026-03-03T20:00:00.000Z",
+      "lastRunAt": "2026-03-03T19:30:00.000Z",
+      "nextRunAt": null,
+      "lastRunStatus": "success",
+      "lastDurationMs": 9200,
+      "runCount": 81,
+      "successCount": 79,
+      "failureCount": 2
+    }
+  ],
+  "logs": [
+    {
+      "id": "log-001",
+      "jobId": "job-news-briefing",
+      "timestamp": "2026-03-03T13:00:00.000Z",
+      "status": "success",
+      "durationMs": 18200,
+      "message": "Briefing generated and posted to channel."
+    },
+    {
+      "id": "log-003",
+      "jobId": "job-project-sync",
+      "timestamp": "2026-03-03T19:30:00.000Z",
+      "status": "success",
+      "durationMs": 9200,
+      "message": "Project and task caches refreshed."
+    }
+  ]
+}

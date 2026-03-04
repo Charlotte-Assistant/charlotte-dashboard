@@ -123,6 +123,20 @@ export default function Sidebar({
                   </div>
                 </SidebarLink>
               </li>
+              {/* Scheduled Jobs */}
+              <li className={`pl-4 pr-3 py-2 rounded-lg mb-0.5 last:mb-0 bg-linear-to-r ${segments.includes('scheduled-jobs') && 'from-violet-500/[0.12] dark:from-violet-500/[0.24] to-violet-500/[0.04]'}`}>
+                <SidebarLink href="/charlotte/scheduled-jobs">
+                  <div className="flex items-center">
+                    <svg className={`shrink-0 fill-current ${segments.includes('scheduled-jobs') ? 'text-violet-500' : 'text-gray-400 dark:text-gray-500'}`} xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+                      <path d="M8 0a8 8 0 108 8A8.009 8.009 0 008 0zm0 14A6 6 0 118 2a6.007 6.007 0 016 6 6.007 6.007 0 01-6 6z" />
+                      <path d="M8.707 4.293A1 1 0 008 4v4a1 1 0 00.293.707l2 2a1 1 0 001.414-1.414L9 6.586V4a1 1 0 00-.293-.707z" />
+                    </svg>
+                    <span className="text-sm font-medium ml-4 lg:opacity-0 lg:sidebar-expanded:opacity-100 2xl:opacity-100 duration-200">
+                      ⏱️ Scheduled Jobs
+                    </span>
+                  </div>
+                </SidebarLink>
+              </li>
               {/* Memory */}
               <li className={`pl-4 pr-3 py-2 rounded-lg mb-0.5 last:mb-0 bg-linear-to-r ${segments.includes('memory') && 'from-violet-500/[0.12] dark:from-violet-500/[0.24] to-violet-500/[0.04]'}`}>
                 <SidebarLink href="/charlotte/memory">
