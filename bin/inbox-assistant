@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""
+Inbox Assistant
+- Reads unread Gmail with GOG
+- Classifies each email with Gemini
+- Applies actions (unsubscribe/delete/mark read/highlight)
+- Prints formatted summary
+- Optionally sends summary to Telegram
+- Logs runs to ~/.openclaw/workspace/INBOX_ASSISTANT_LOG.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
+LOG_PATH = Path.home() / ".openclaw" / "workspace" / "INBOX_ASSISTANT_LOG.json"
+HIGHLIGHT_LABEL = "Needs-Response"
+DEFAULT_MAX_EMAILS = 50
+
+MARKETING_HINTS = {
+    "sale",
+    "discount",
+    "offer",
+    "limited time",
+    "promo",
+    "promotion",
+    "coupon",
+    "shop now",
+    "buy now",
+    "deal",
+    "save",
+    "% off",
+}
+
+NOTIFICATION_HINTS = {
+    "receipt",
+    "confirmation",
+    "alert",
+    "notification",
+    "digest",
+    "statement",
+    "invoice",
+    "verification",
+    "code",
+    "security",
+    "password reset",
+}
+
+NEEDS_RESPONSE_HINTS = {
+    "can you",
+    "could you",
+    "please review",
+    "let me know",
+    "what do you think",
+    "need your",
+    "request",
+    "question",
+    "asap",
+    "deadline",
+    "approve",
+    "feedback",
+}
+
+
+@dataclass
+class EmailItem:
+    message_id: str
+    thread_id: str
+    sender: str
+    subject: str
+    snippet: str
+    list_unsubscribe: str
+    date: str
+
+
+@dataclass
+class Classification:
+    category: str
+    action: str
+    confidence: float
+    reasoning: str
+    action_items: list[str]
+    source: str
+
+
+class InboxAssistant:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.config = self._load_json_file(OPENCLAW_CONFIG) or {}
+        self.account = ""
+        self.stats = {
+            "processed": 0,
+            "marketing": 0,
+            "notifications": 0,
+            "needs_response": 0,
+            "deleted": 0,
+            "marked_read": 0,
+            "highlighted": 0,
+            "unsubscribed": 0,
+            "errors": 0,
+            "classification_fallbacks": 0,
+        }
+        self.needs_response: list[dict[str, Any]] = []
+
+    def run(self) -> int:
+        self._require_bin("gog")
+        self.account = self._resolve_gog_account(self.args.account)
+        if self.args.analyze:
+            self._require_bin("gemini")
+
+        emails = self._fetch_unread_emails(limit=self.args.max_emails)
+        if not emails:
+            summary = self._format_summary()
+            print(summary)
+            self._log_run(summary)
+            if self.args.send_summary == "telegram":
+                self._send_telegram_summary(summary)
+            return 0
+
+        label_exists = False
+        label_name = None
+        if self.args.analyze:
+            label_name = self._ensure_label(HIGHLIGHT_LABEL)
+            label_exists = bool(label_name)
+
+        delete_ids: list[str] = []
+        mark_read_ids: list[str] = []
+        highlight_ids: list[str] = []
+
+        for email in emails:
+            self.stats["processed"] += 1
+            try:
+                classification = self._classify_email(email)
+                category = classification.category
+                if category == "marketing":
+                    self.stats["marketing"] += 1
+                    if self.args.unsubscribe:
+                        if self._try_unsubscribe(email.list_unsubscribe):
+                            self.stats["unsubscribed"] += 1
+                    if self.args.auto_delete:
+                        delete_ids.append(email.message_id)
+                elif category == "notifications":
+                    self.stats["notifications"] += 1
+                    mark_read_ids.append(email.message_id)
+                else:
+                    self.stats["needs_response"] += 1
+                    self.needs_response.append(
+                        {
+                            "subject": email.subject,
+                            "sender": email.sender,
+                            "action_items": classification.action_items[:3],
+                            "confidence": classification.confidence,
+                            "source": classification.source,
+                        }
+                    )
+                    if label_exists and label_name:
+                        highlight_ids.append(email.message_id)
+            except Exception:
+                self.stats["errors"] += 1
+
+        if mark_read_ids:
+            if self._batch_modify(mark_read_ids, remove_labels=["UNREAD"]):
+                self.stats["marked_read"] += len(mark_read_ids)
+
+        if highlight_ids and label_name:
+            if self._batch_modify(highlight_ids, add_labels=[label_name]):
+                self.stats["highlighted"] += len(highlight_ids)
+
+        if delete_ids:
+            if self._batch_delete(delete_ids):
+                self.stats["deleted"] += len(delete_ids)
+
+        summary = self._format_summary()
+        print(summary)
+
+        if self.args.send_summary == "telegram":
+            self._send_telegram_summary(summary)
+
+        self._log_run(summary)
+        return 0 if self.stats["errors"] == 0 else 2
+
+    def _load_json_file(self, path: Path) -> dict[str, Any] | None:
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return None
+
+    def _require_bin(self, name: str) -> None:
+        if shutil.which(name):
+            return
+        raise RuntimeError(f"Required binary not found: {name}")
+
+    def _run_cmd(self, cmd: list[str], env: dict[str, str] | None = None) -> str:
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip() or f"command failed: {' '.join(cmd)}")
+        return result.stdout.strip()
+
+    def _run_cmd_json(self, cmd: list[str], env: dict[str, str] | None = None) -> Any:
+        out = self._run_cmd(cmd, env=env)
+        if not out:
+            return {}
+        return json.loads(out)
+
+    def _resolve_gog_account(self, arg_account: str | None) -> str:
+        if arg_account:
+            return arg_account
+        env_account = os.getenv("GOG_ACCOUNT", "").strip()
+        if env_account:
+            return env_account
+
+        cmd = ["gog", "auth", "list", "--json", "--results-only", "--no-input"]
+        try:
+            entries = self._run_cmd_json(cmd)
+            if isinstance(entries, list):
+                for item in entries:
+                    email = str(item.get("email", "")).strip()
+                    if email:
+                        return email
+        except Exception:
+            pass
+
+        status_cmd = ["gog", "auth", "status", "--json", "--results-only", "--no-input"]
+        try:
+            status = self._run_cmd_json(status_cmd)
+            email = str(status.get("account", {}).get("email", "")).strip()
+            if email:
+                return email
+        except Exception:
+            pass
+
+        raise RuntimeError("No GOG account configured. Set --account or GOG_ACCOUNT.")
+
+    def _fetch_unread_emails(self, limit: int) -> list[EmailItem]:
+        query_cmd = [
+            "gog",
+            "gmail",
+            "messages",
+            "search",
+            "is:unread",
+            "--max",
+            str(limit),
+            "--json",
+            "--results-only",
+            "--no-input",
+            "--account",
+            self.account,
+        ]
+        results = self._run_cmd_json(query_cmd)
+        if not isinstance(results, list):
+            return []
+
+        emails: list[EmailItem] = []
+        for item in results:
+            msg_id = str(item.get("id") or item.get("messageId") or "").strip()
+            thread_id = str(item.get("threadId") or "").strip()
+            if not msg_id:
+                continue
+
+            detail_cmd = [
+                "gog",
+                "gmail",
+                "get",
+                msg_id,
+                "--format",
+                "metadata",
+                "--headers",
+                "From,Subject,List-Unsubscribe,Date",
+                "--json",
+                "--results-only",
+                "--no-input",
+                "--account",
+                self.account,
+            ]
+            detail = self._run_cmd_json(detail_cmd)
+            headers = self._extract_headers(detail)
+
+            sender = headers.get("from", "Unknown")
+            subject = headers.get("subject", "(No Subject)")
+            list_unsub = headers.get("list-unsubscribe", "")
+            date = headers.get("date", "")
+            snippet = str(item.get("snippet") or detail.get("snippet") or "")
+
+            emails.append(
+                EmailItem(
+                    message_id=msg_id,
+                    thread_id=thread_id,
+                    sender=sender,
+                    subject=subject,
+                    snippet=snippet,
+                    list_unsubscribe=list_unsub,
+                    date=date,
+                )
+            )
+
+        return emails
+
+    def _extract_headers(self, detail: dict[str, Any]) -> dict[str, str]:
+        headers = {}
+        payload = detail.get("payload", {}) if isinstance(detail, dict) else {}
+        raw_headers = payload.get("headers", []) if isinstance(payload, dict) else []
+        if isinstance(raw_headers, list):
+            for h in raw_headers:
+                name = str(h.get("name", "")).strip().lower()
+                value = str(h.get("value", "")).strip()
+                if name:
+                    headers[name] = value
+        return headers
+
+    def _ensure_label(self, label_name: str) -> str | None:
+        list_cmd = [
+            "gog",
+            "gmail",
+            "labels",
+            "list",
+            "--json",
+            "--results-only",
+            "--no-input",
+            "--account",
+            self.account,
+        ]
+        try:
+            labels = self._run_cmd_json(list_cmd)
+            if isinstance(labels, list):
+                for label in labels:
+                    name = str(label.get("name", "")).strip()
+                    if name.lower() == label_name.lower():
+                        return name
+        except Exception:
+            return None
+
+        create_cmd = [
+            "gog",
+            "gmail",
+            "labels",
+            "create",
+            label_name,
+            "--json",
+            "--results-only",
+            "--no-input",
+            "--account",
+            self.account,
+        ]
+        try:
+            self._run_cmd_json(create_cmd)
+            return label_name
+        except Exception:
+            return None
+
+    def _classify_email(self, email: EmailItem) -> Classification:
+        if not self.args.analyze:
+            return self._heuristic_classification(email)
+
+        prompt = textwrap.dedent(
+            f"""
+            Classify this email into EXACTLY one category and action.
+
+            Categories:
+            - marketing: promo/sales/newsletters, unsubscribe links, commercial pitches
+            - notifications: automated service updates/receipts/alerts/no reply needed
+            - needs_response: direct asks/questions/tasks/team communication requiring human response
+
+            Required JSON only:
+            {{
+              "category": "marketing|notifications|needs_response",
+              "action": "unsubscribe_delete|mark_read|keep_unread_highlight",
+              "confidence": 0.0,
+              "reasoning": "short",
+              "action_items": ["item1", "item2"]
+            }}
+
+            Email data:
+            - from: {email.sender}
+            - subject: {email.subject}
+            - snippet: {email.snippet}
+            - has_list_unsubscribe: {bool(email.list_unsubscribe)}
+            - date: {email.date}
+            """
+        ).strip()
+
+        env = os.environ.copy()
+        env.setdefault("GEMINI_CLI_HOME", str(Path.home() / ".openclaw" / "workspace" / ".gemini-cli"))
+
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            api_key = (
+                self.config.get("skills", {})
+                .get("entries", {})
+                .get("nano-banana-pro", {})
+                .get("apiKey", "")
+            )
+            if api_key:
+                env["GEMINI_API_KEY"] = api_key
+
+        cmd = [
+            "gemini",
+            "-p",
+            prompt,
+            "-o",
+            "text",
+            "--model",
+            self.args.gemini_model,
+        ]
+
+        try:
+            output = self._run_cmd(cmd, env=env)
+            data = self._extract_json_object(output)
+            category = str(data.get("category", "")).strip().lower()
+            action = str(data.get("action", "")).strip().lower()
+            confidence = float(data.get("confidence", 0.0) or 0.0)
+            reasoning = str(data.get("reasoning", "")).strip()
+            action_items = data.get("action_items", [])
+            if not isinstance(action_items, list):
+                action_items = []
+            action_items = [str(x).strip() for x in action_items if str(x).strip()][:3]
+
+            if category not in {"marketing", "notifications", "needs_response"}:
+                raise ValueError("invalid category")
+            if action not in {"unsubscribe_delete", "mark_read", "keep_unread_highlight"}:
+                raise ValueError("invalid action")
+
+            return Classification(
+                category=category,
+                action=action,
+                confidence=max(0.0, min(confidence, 1.0)),
+                reasoning=reasoning,
+                action_items=action_items,
+                source="gemini",
+            )
+        except Exception:
+            self.stats["classification_fallbacks"] += 1
+            return self._heuristic_classification(email)
+
+    def _extract_json_object(self, text: str) -> dict[str, Any]:
+        text = text.strip()
+        if not text:
+            raise ValueError("empty model response")
+
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise ValueError("no json object found")
+        data = json.loads(match.group(0))
+        if not isinstance(data, dict):
+            raise ValueError("json is not object")
+        return data
+
+    def _heuristic_classification(self, email: EmailItem) -> Classification:
+        sender = email.sender.lower()
+        subject = email.subject.lower()
+        snippet = email.snippet.lower()
+        combined = f"{sender} {subject} {snippet}"
+
+        has_unsub = bool(email.list_unsubscribe.strip())
+        if has_unsub or any(k in combined for k in MARKETING_HINTS):
+            return Classification(
+                category="marketing",
+                action="unsubscribe_delete",
+                confidence=0.55,
+                reasoning="Detected unsubscribe/promo indicators",
+                action_items=[],
+                source="heuristic",
+            )
+
+        if (
+            "no-reply" in sender
+            or "noreply" in sender
+            or "do-not-reply" in sender
+            or any(k in combined for k in NOTIFICATION_HINTS)
+        ):
+            return Classification(
+                category="notifications",
+                action="mark_read",
+                confidence=0.6,
+                reasoning="Looks like an automated notification",
+                action_items=[],
+                source="heuristic",
+            )
+
+        items: list[str] = []
+        if "?" in email.subject or "?" in email.snippet:
+            items.append("Answer question(s) in the email")
+        if any(k in combined for k in NEEDS_RESPONSE_HINTS):
+            items.append("Follow up on the explicit request")
+        if not items:
+            items.append("Review and reply if needed")
+
+        return Classification(
+            category="needs_response",
+            action="keep_unread_highlight",
+            confidence=0.58,
+            reasoning="Potentially actionable human message",
+            action_items=items,
+            source="heuristic",
+        )
+
+    def _batch_modify(self, message_ids: list[str], add_labels: list[str] | None = None, remove_labels: list[str] | None = None) -> bool:
+        add_labels = add_labels or []
+        remove_labels = remove_labels or []
+
+        ok = True
+        for i in range(0, len(message_ids), 50):
+            chunk = message_ids[i : i + 50]
+            cmd = [
+                "gog",
+                "gmail",
+                "batch",
+                "modify",
+                *chunk,
+                "--account",
+                self.account,
+                "--no-input",
+                "--force",
+            ]
+            if add_labels:
+                cmd.extend(["--add", ",".join(add_labels)])
+            if remove_labels:
+                cmd.extend(["--remove", ",".join(remove_labels)])
+            try:
+                self._run_cmd(cmd)
+            except Exception:
+                ok = False
+                self.stats["errors"] += 1
+        return ok
+
+    def _batch_delete(self, message_ids: list[str]) -> bool:
+        ok = True
+        for i in range(0, len(message_ids), 50):
+            chunk = message_ids[i : i + 50]
+            cmd = [
+                "gog",
+                "gmail",
+                "batch",
+                "delete",
+                *chunk,
+                "--account",
+                self.account,
+                "--no-input",
+                "--force",
+            ]
+            try:
+                self._run_cmd(cmd)
+            except Exception:
+                ok = False
+                self.stats["errors"] += 1
+        return ok
+
+    def _try_unsubscribe(self, list_unsubscribe: str) -> bool:
+        if not list_unsubscribe:
+            return False
+
+        urls = re.findall(r"<([^>]+)>", list_unsubscribe)
+        if not urls:
+            urls = [x.strip() for x in list_unsubscribe.split(",") if x.strip()]
+
+        for url in urls:
+            if not url.lower().startswith("http"):
+                continue
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=10):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _format_summary(self) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        slot = self.args.time.capitalize()
+
+        lines = [
+            f"📬 Inbox Assistant Report ({slot})",
+            f"🕒 {now}",
+            "",
+            "📊 Processing Stats",
+            f"• Processed: {self.stats['processed']}",
+            f"• 🗑️ Deleted: {self.stats['deleted']}",
+            f"• 🔗 Unsubscribed: {self.stats['unsubscribed']}",
+            f"• ✅ Marked Read: {self.stats['marked_read']}",
+            f"• ⭐ Highlighted: {self.stats['highlighted']}",
+            f"• 🟡 Needs Response: {self.stats['needs_response']}",
+            f"• ⚠️ Errors: {self.stats['errors']}",
+        ]
+
+        if self.stats["classification_fallbacks"]:
+            lines.append(f"• 🤖 AI Fallbacks: {self.stats['classification_fallbacks']}")
+
+        lines.extend([
+            "",
+            "📂 Classification Totals",
+            f"• Marketing/Promotional: {self.stats['marketing']}",
+            f"• Notifications: {self.stats['notifications']}",
+            f"• Important/Needs Response: {self.stats['needs_response']}",
+            "",
+            "💬 Emails Needing Response",
+        ])
+
+        if not self.needs_response:
+            lines.append("• None in this run")
+        else:
+            for idx, item in enumerate(self.needs_response[:20], start=1):
+                subject = item["subject"]
+                sender = item["sender"]
+                actions = item.get("action_items") or []
+                action_text = "; ".join(actions[:2]) if actions else "Review and respond"
+                lines.append(f"{idx}. ✉️ {subject}")
+                lines.append(f"   From: {sender}")
+                lines.append(f"   Action: {action_text}")
+
+            if len(self.needs_response) > 20:
+                lines.append(f"… plus {len(self.needs_response) - 20} more")
+
+        return "\n".join(lines)
+
+    def _telegram_config(self) -> tuple[str | None, str | None]:
+        channels = self.config.get("channels", {})
+        tg = channels.get("telegram", {}) if isinstance(channels, dict) else {}
+        token = str(tg.get("botToken", "")).strip() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if not chat_id:
+            allow = tg.get("allowFrom", []) if isinstance(tg, dict) else []
+            if isinstance(allow, list) and allow:
+                chat_id = str(allow[0]).strip()
+        return (token or None, chat_id or None)
+
+    def _split_telegram_chunks(self, text: str, max_len: int = 3900) -> list[str]:
+        if len(text) <= max_len:
+            return [text]
+        chunks: list[str] = []
+        remaining = text
+        while len(remaining) > max_len:
+            cut = remaining.rfind("\n", 0, max_len)
+            if cut < 0:
+                cut = max_len
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    def _send_telegram_summary(self, summary: str) -> None:
+        token, chat_id = self._telegram_config()
+        if not token or not chat_id:
+            self.stats["errors"] += 1
+            return
+
+        for chunk in self._split_telegram_chunks(summary):
+            payload = urllib.parse.urlencode(
+                {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": "true",
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=payload,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15):
+                    pass
+            except Exception:
+                self.stats["errors"] += 1
+
+    def _log_run(self, summary: str) -> None:
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "time_slot": self.args.time,
+            "flags": {
+                "analyze": bool(self.args.analyze),
+                "unsubscribe": bool(self.args.unsubscribe),
+                "auto_delete": bool(self.args.auto_delete),
+                "format": self.args.format,
+                "send_summary": self.args.send_summary,
+            },
+            "account": self.account,
+            "stats": self.stats,
+            "needs_response": self.needs_response,
+            "summary": summary,
+        }
+
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {"runs": []}
+        if LOG_PATH.exists():
+            try:
+                existing = json.loads(LOG_PATH.read_text())
+                if isinstance(existing, dict) and isinstance(existing.get("runs"), list):
+                    data = existing
+            except Exception:
+                pass
+
+        data["runs"].append(record)
+        data["runs"] = data["runs"][-200:]
+        LOG_PATH.write_text(json.dumps(data, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Inbox Assistant automation")
+    parser.add_argument("--time", choices=["morning", "evening"], required=True)
+    parser.add_argument("--analyze", action="store_true", help="Use AI classification")
+    parser.add_argument("--unsubscribe", action="store_true", help="Attempt unsubscribe for marketing")
+    parser.add_argument("--auto-delete", action="store_true", help="Delete marketing emails")
+    parser.add_argument("--format", choices=["summary"], default="summary")
+    parser.add_argument("--send-summary", choices=["telegram"], default=None)
+    parser.add_argument("--account", default=None, help="GOG account email")
+    parser.add_argument("--max-emails", type=int, default=DEFAULT_MAX_EMAILS)
+    parser.add_argument("--gemini-model", default="gemini-2.5-flash")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        assistant = InboxAssistant(args)
+        return assistant.run()
+    except Exception as exc:
+        err = {
+            "timestamp": datetime.now().isoformat(),
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existing = {"runs": []}
+        if LOG_PATH.exists():
+            try:
+                raw = json.loads(LOG_PATH.read_text())
+                if isinstance(raw, dict) and isinstance(raw.get("runs"), list):
+                    existing = raw
+            except Exception:
+                pass
+        existing["runs"].append(err)
+        existing["runs"] = existing["runs"][-200:]
+        LOG_PATH.write_text(json.dumps(existing, indent=2))
+
+        print(f"❌ Inbox Assistant failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
