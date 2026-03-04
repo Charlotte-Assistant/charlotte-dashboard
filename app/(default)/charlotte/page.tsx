@@ -8,6 +8,7 @@ import ChannelsCard from './channels-card'
 import IntegrationsCard from './integrations-card'
 import MemoryStatsCard from './memory-stats-card'
 import MemorySearchCard from './memory-search-card'
+import MemorySummaryCard from './memory-summary-card'
 import ClusterNavigationCard from './cluster-navigation-card'
 import SystemMetricsCard from './system-metrics-card'
 import TasksSummaryCard from './tasks-summary-card'
@@ -62,6 +63,9 @@ export default function CharlotteHealth() {
 
         {/* Projects Management Card */}
         <ProjectsCard />
+
+        {/* Memory Summary Card */}
+        <MemorySummaryCard />
 
         {/* Memory Stats */}
         <MemoryStatsCard />
